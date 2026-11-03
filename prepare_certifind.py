@@ -97,6 +97,17 @@ SCHEMES = {
 }
 DEFAULT_SCHEME = ("ISO/IEC 17021-1", "")
 
+# Schemes left out of CertiFind: Greek national standards (ELOT, AGRO) and EU-directive
+# notified-body modules, which are not management-system standards. They stay in
+# FIELD_PATTERNS so their register rows are recognised and listed in the review file
+# instead of being matched to another standard.
+EXCLUDED_SCHEMES = {
+    "ELOT 1429": "Greek national standard",
+    "ELOT 1435": "Greek national standard",
+    "AGRO 2": "Greek national scheme",
+    "EU Directives QA": "EU-directive notified-body module, not a management-system standard",
+}
+
 # ---------------------------------------------------------------------------------------------
 # DRAFT category -> EA mappings, the same tables as database/turkak-scraper/prepare_certifind.py
 # (copied from how data/renar-romania and data/dpa-albania classified these categories).
@@ -186,6 +197,12 @@ NACE_TO_EA = {
     **{d: 39 for d in ("37", "38", "39", "59", "60", "90", "91", "92", "93", "94", "96")},
 }
 
+# NACE divisions and groups that IAF ID 1 splits over several EA sectors. Listed without a
+# finer code, they map to every sector they touch, each marked as a limited scope.
+NACE_SPANS = {
+    "30": "18;20-22", "33": "17-23", "33.1": "17-23", "35": "25-27", "58": "8;33", "95": "19;29",
+}
+
 # Schemes whose annex normally lists sectors. When such an annex is missing, no scope row is
 # written: recording ALL would make the body match sectors it may not hold.
 SECTOR_SCHEMES = {"ISO 9001", "ISO 14001", "ISO 45001", "ISO 22000", "FSSC 22000", "ISO 50001",
@@ -215,7 +232,7 @@ class Review:
     def write(self, path: Path, summary: list[str]) -> None:
         order = ["Draft EA mappings (check these)", "Merged duplicates", "Annexes not read",
                  "Annexes without a sector table (recorded as ALL)", "Fallback dates and numbers",
-                 "Bodies without scopes", "Normalised values"]
+                 "Bodies without scopes", "Excluded schemes", "Unmapped NACE codes", "Normalised values"]
         out = ["# ESYD dataset review", "", *summary, ""]
         for name in order + [s for s in self.sections if s not in order]:
             items = self.sections.get(name)
@@ -233,6 +250,7 @@ class Annex:
     notes: list[str] = field(default_factory=list)
     has_table: bool = False
     extra_standards: list[str] = field(default_factory=list)
+    unmapped_nace: list[str] = field(default_factory=list)
     cert_no: str = ""
     valid_until: str = ""
     annex_date: str = ""
@@ -385,6 +403,13 @@ def parse_annex(text: str, standard: str) -> Annex:
             ea = (NACE_TO_EA.get(f"{division}.{sub}") or NACE_TO_EA.get(f"{division}.{sub[:1]}")
                   or NACE_TO_EA.get(division)) if sub else NACE_TO_EA.get(division)
             if ea is None:
+                span = NACE_SPANS.get(f"{division}.{sub}" if sub else division)
+                if span is None:
+                    annex.unmapped_nace.append(m.group(0))
+                    continue
+                annex.ea |= expand(span)
+                annex.limited |= expand(span)
+                annex.has_table = True
                 continue
             annex.ea.add(ea)
             annex.has_table = True
@@ -565,6 +590,9 @@ def run(args: argparse.Namespace) -> int:
         if standard is None:
             review.add("Annexes not read", f"{bid} {name}: field `{row['field']}` matches no known standard")
             continue
+        if standard in EXCLUDED_SCHEMES:
+            review.add("Excluded schemes", f"{bid} {name} {standard}: {EXCLUDED_SCHEMES[standard]}")
+            continue
 
         path = doc_path(docs, bid, row["scope_doc_en"]) or doc_path(docs, bid, row["scope_doc_el"])
         annex = Annex()
@@ -578,6 +606,9 @@ def run(args: argparse.Namespace) -> int:
                 annex = parse_annex(read_text(path), standard)
             except Exception as exc:  # a broken file should not stop the other 388
                 review.add("Annexes not read", f"{bid} {name} {standard}: {path.name} unreadable ({exc}); recorded as ALL")
+        if annex.unmapped_nace and annex.has_table:
+            review.add("Unmapped NACE codes", f"{bid} {name} {standard}: "
+                       f"{', '.join(dict.fromkeys(annex.unmapped_nace))} not in NACE_TO_EA; left out")
         if annex.cert_no:
             meta["cert"][annex.cert_no] += 2       # the annex outranks the register's number
         if annex.valid_until:
@@ -694,6 +725,12 @@ def run(args: argparse.Namespace) -> int:
         review.add("Fallback dates and numbers", f"scope {s['certificate_number']} {s['certification_standard']} "
                    "dropped: its accreditation has no date")
     scopes = [s for s in scopes if s["certificate_number"] in known]
+    # A body with no accreditation has nothing to search for; keep it out of the directory.
+    accredited = {a["body_name"] for a in accreditations}
+    for b in bodies:
+        if b["name"] not in accredited:
+            review.add("Bodies without scopes", f"{b['name']}: no dated accreditation; body not written")
+    bodies = [b for b in bodies if b["name"] in accredited]
 
     args.out.mkdir(parents=True, exist_ok=True)
     scopes.sort(key=lambda s: (s["certificate_number"], s["certification_standard"]))
